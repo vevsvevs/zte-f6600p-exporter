@@ -1,15 +1,16 @@
 # ZTE F6600P Configuration Exporter
 
-A small command-line tool for exporting and decrypting configuration data from supported ZTE routers. Developed and tested with a **ZTE ZXHN F6600P running Vodafone Spain firmware V9.1.10P5N20 (V14)**.
+A small command-line tool for exporting and decrypting configuration data from supported ZTE routers. Developed and tested with a **ZTE ZXHN F6600P running Vodafone Spain firmware V9.1.10P5N20 (V14)**. Compatibility beyond the tested device is not guaranteed.
 
-## Features
+## Modes
 
-- **Online mode:** log in to the router, export and decrypt the web configuration, and generate a readable credentials report.
-- **Optional Telnet access:** collect GPON identity information and a decrypted internal configuration database. Temporary Telnet can be closed at the end of the session.
-- **Offline mode:** decrypt a previously downloaded ZTE Type 6 configuration file without connecting to the router.
-- Supports firmware-specific web endpoints through editable `WEB_PROFILES` in the script.
+### Online mode
 
-Compatibility with other ZTE models or firmware versions is **not guaranteed**.
+Connects to the router, downloads and decrypts its web configuration, and creates a readable credentials report. It then uses temporary Factory Telnet (or an existing Telnet session) to collect GPON information and decrypt the internal configuration database. At the end, you can choose to **leave Telnet enabled**; by default, the tool attempts to close it. If Telnet is unavailable, the web configuration export may still succeed.
+
+### Offline mode
+
+Decrypts a previously saved ZTE Type 6 web backup or internal configuration database **without connecting to the router**. Web backups also produce a credentials report.
 
 ## Download and usage
 
@@ -27,7 +28,7 @@ For offline decryption:
 .\ZTE-F6600P-Export.exe configurationBackup.cfg
 ```
 
-The tool prompts for required credentials and saves the exported files in a newly created local folder.
+The tool prompts for required credentials and saves exported files in a newly created local folder. If you keep temporary Telnet enabled in online mode, reboot the router afterward and verify that access is no longer available.
 
 ### Run from source
 
