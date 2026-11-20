@@ -24,7 +24,6 @@ import struct
 import sys
 import time
 import zlib
-from getpass import getpass
 from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -154,8 +153,13 @@ def unpack_zte_chunks(inner: bytes, max_size: int = MAX_CONFIG_SIZE) -> bytes:
     return bytes(output)
 
 
-def web_backup_layout(blob: bytes) -> tuple[int, int, int, int]:
-    """Return container start, Type-6 header offset, inner size and cipher size."""
+def web_backup_cipher(password: str) -> Cipher:
+    key = hashlib.sha256(password.encode('utf-8')).digest()
+    iv = hashlib.sha256(ZTE_IV).digest()[:16]
+    return Cipher(algorithms.AES(key), modes.CBC(iv))
+
+
+def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
     i = blob.find(MAGIC)
     if i < 0:
         raise ValueError('Type 6 ZTE container not found')
@@ -169,7 +173,6 @@ def web_backup_layout(blob: bytes) -> tuple[int, int, int, int]:
     if not re.fullmatch(r'[A-Za-z0-9_.-]{3,128}', signature):
         raise ValueError(f'Unexpected ZTE signature {signature!r}')
     offset += siglen
-    payload_offset = offset
     header = struct.unpack_from('>15I', data, offset)
     if header[:2] != (PAYLOAD_MAGIC, 6):
         raise ValueError('Expected ZTE Type 6 payload')
@@ -179,158 +182,51 @@ def web_backup_layout(blob: bytes) -> tuple[int, int, int, int]:
     if (next_chunk != 0 or cipherlen % 16 != 0 or origlen > cipherlen
             or offset+cipherlen > len(data) or origlen < 60):
         raise ValueError('Unexpected ciphertext layout')
-    return i, i + payload_offset, origlen, cipherlen
+    dec = web_backup_cipher(backup_password).decryptor()
+    inner = (dec.update(bytes(data[offset:offset+cipherlen])) + dec.finalize())[:origlen]
+    return unpack_zte_chunks(inner)
 
 
-def web_backup_cipher(password: str) -> Cipher:
-    key = hashlib.sha256(password.encode('utf-8')).digest()
-    iv = hashlib.sha256(ZTE_IV).digest()[:16]
-    return Cipher(algorithms.AES(key), modes.CBC(iv))
-
-
-def decrypt_web_payload(ciphertext: bytes, password: str) -> bytes:
-    dec = web_backup_cipher(password).decryptor()
-    return dec.update(ciphertext) + dec.finalize()
-
-
-def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
-    _, payload, inner_size, cipher_size = web_backup_layout(blob)
-    start = payload + 72
-    data = decrypt_web_payload(blob[start:start + cipher_size], backup_password)
-    return unpack_zte_chunks(data[:inner_size])
-
-
-class ConfigTreeBuilder(ET.TreeBuilder):
-    def doctype(self, name: str, pubid: str | None, system: str | None) -> None:
-        raise ValueError('DOCTYPE declarations are not allowed in WEB configuration XML')
-
-
-def parse_web_xml(xml: bytes) -> ET.Element:
-    if len(xml) > MAX_CONFIG_SIZE:
-        raise ValueError('XML exceeds the configuration size limit')
-    root = ET.fromstring(xml, parser=ET.XMLParser(target=ConfigTreeBuilder()))
-    if root.tag != 'DB' or not len(root):
-        raise ValueError('Expected a nonempty ZTE XML database with a DB root')
-    return root
-
-
-def validate_web_xml(root: ET.Element, original: ET.Element) -> None:
-    """Compare structure without comparing settings, row indices or other data values."""
-    pending = [(root, original, '/DB')]
-    while pending:
-        current, expected, location = pending.pop()
-        if (current.tag != expected.tag or current.attrib.keys() != expected.attrib.keys()
-                or current.attrib.get('name') != expected.attrib.get('name')
-                or len(current) != len(expected)):
-            raise ValueError(f'XML structure differs from the WEB backup at {location}')
-        if len(current) and ((current.text or '').strip()
-                             or any((child.tail or '').strip() for child in current)):
-            raise ValueError(f'Unexpected text between XML elements at {location}')
-        for index in reversed(range(len(current))):
-            child = expected[index]
-            pending.append((current[index], child, f'{location}/{child.tag}[{index + 1}]'))
-
-
-def pack_zte_chunks(xml: bytes, template: bytes) -> bytes:
-    """Rebuild the compressed payload using the template's chunk and CRC conventions."""
-    header = list(struct.unpack_from('>15I', template))
-    chunk_size = header[4]
-    if (not 0 < chunk_size <= MAX_CONFIG_SIZE
-            or (len(xml) + chunk_size - 1) // chunk_size > MAX_CONFIG_CHUNKS):
-        raise ValueError('Unsupported ZTE compression chunk size')
-
-    # Inspect the already verified original chunks for the length/continuation conventions.
-    pos, continuation = 60, set()
-    while True:
-        n_plain, n_z, following = struct.unpack_from('>III', template, pos)
-        if n_plain > chunk_size or (following and n_plain != chunk_size):
-            raise ValueError('Unsupported ZTE compression chunk boundaries')
-        last_start = pos
-        pos += 12 + n_z
-        if not following:
-            break
-        if following not in (1, pos):
-            raise ValueError('Unsupported ZTE compression continuation field')
-        continuation.add(following == 1)
-    if len(continuation) > 1 or header[3] not in (0, last_start, len(template)):
-        raise ValueError('Unsupported ZTE compression length fields')
-    if header[6] not in (0, zlib.crc32(template[:24])) or any(header[7:]):
-        raise ValueError('Unsupported ZTE compression header')
-
+def pack_zte_chunks(xml: bytes) -> bytes:
+    """Compress the XML in Type-0 chunks with data and header CRCs."""
+    chunk_size = 64 * 1024
     crc, payload = 0, bytearray()
+    last_start = 60
     for start in range(0, len(xml), chunk_size):
         block = xml[start:start + chunk_size]
         compressed = zlib.compress(block, level=9)
         last_start = 60 + len(payload)
-        following = 0
-        if start + len(block) < len(xml):
-            following = 1 if True in continuation else last_start + 12 + len(compressed)
-        payload.extend(struct.pack('>III', len(block), len(compressed), following))
+        next_offset = last_start + 12 + len(compressed)
+        if start + len(block) == len(xml):
+            next_offset = 0
+        payload.extend(struct.pack('>III', len(block), len(compressed), next_offset))
         payload.extend(compressed)
         crc = zlib.crc32(compressed, crc)
 
-    header[2], header[5] = len(xml), crc
-    if header[3]:
-        header[3] = 60 + len(payload) if header[3] == len(template) else last_start
-    if header[6]:
-        header[6] = zlib.crc32(struct.pack('>6I', *header[:6]))
-    return struct.pack('>15I', *header) + payload
+    fields = struct.pack('>6I', PAYLOAD_MAGIC, 0, len(xml), last_start, chunk_size, crc)
+    return fields + struct.pack('>I', zlib.crc32(fields)) + bytes(32) + payload
 
 
-def pack_web_backup(xml: bytes, template: bytes, password: str) -> bytes:
-    """Pack WEB XML against a backup from the target router."""
-    root = parse_web_xml(xml)
-    container, payload, inner_size, cipher_size = web_backup_layout(template)
-    start = payload + 72
-    if start + cipher_size != len(template):
-        raise ValueError('Unsupported data after the WEB backup ciphertext')
+def pack_web_backup(xml: bytes, password: str) -> bytes:
+    """Check XML syntax and build an encrypted ZTE F6600P WEB backup."""
+    if len(xml) > MAX_CONFIG_SIZE:
+        raise ValueError('XML exceeds the configuration size limit')
+    ET.fromstring(xml)
 
-    # Signed payload size counts from the end of the 128-byte container header.
-    old_size = len(template) - container - 128
-    for endian in ('>', '<'):
-        version, = struct.unpack_from(endian + 'I', template, container + 24)
-        header_size, signed_size = struct.unpack_from(endian + 'II', template, container + 68)
-        if (version, header_size, signed_size) == (4, 128, old_size):
-            break
-    else:
-        raise ValueError('Unsupported WEB backup container header')
-
-    padded = decrypt_web_payload(template[start:], password)
-    inner = padded[:inner_size]
-    original = unpack_zte_chunks(inner)
-    validate_web_xml(root, parse_web_xml(original))
-    packed = pack_zte_chunks(xml, inner)
-
-    pad = padded[inner_size:]
-    if len(pad) < 16 and not any(pad):
-        padding = bytes(-len(packed) % 16)
-    elif 1 <= len(pad) <= 16 and pad == bytes([len(pad)]) * len(pad):
-        pad_size = 16 - len(packed) % 16
-        padding = bytes([pad_size]) * pad_size
-    else:
-        raise ValueError('Unsupported WEB backup AES padding')
+    packed = pack_zte_chunks(xml)
     enc = web_backup_cipher(password).encryptor()
-    ciphertext = enc.update(packed + padding) + enc.finalize()
+    ciphertext = enc.update(packed + bytes(-len(packed) % 16)) + enc.finalize()
+    signature = b'F6600P'
+    signature_block = struct.pack('>III', SIG_MAGIC, 0, len(signature)) + signature
+    type6_header = struct.pack('>II', PAYLOAD_MAGIC, 6) + bytes(52)
+    block_header = struct.pack('>III', len(packed), len(ciphertext), 0)
+    signed_size = len(signature_block) + len(type6_header) + len(block_header) + len(ciphertext)
 
-    encrypted_header = list(struct.unpack_from('>15I', template, payload))
-    if any(encrypted_header[5:]) or encrypted_header[2] not in (0, inner_size):
-        raise ValueError('Unsupported WEB backup encryption header')
-    if encrypted_header[3] not in (0, cipher_size + 72):
-        raise ValueError('Unsupported WEB backup encrypted block size field')
-    if encrypted_header[2]:
-        encrypted_header[2] = len(packed)
-    if encrypted_header[3]:
-        encrypted_header[3] = len(ciphertext) + 72
-
-    preamble = bytearray(template[:payload])
-    struct.pack_into(endian + 'I', preamble, container + 72,
-                     old_size - cipher_size + len(ciphertext))
-    header = struct.pack('>18I', *encrypted_header, len(packed), len(ciphertext), 0)
-    result = bytes(preamble) + header + ciphertext
-    if decrypt_backup(result, password) != xml:
-        raise ValueError('WEB backup verification failed')
-    return result
-
+    outer = bytearray(MAGIC + bytes(112))
+    # ZTE's 128-byte outer header uses little-endian fields on this model.
+    struct.pack_into('<I', outer, 24, 4)
+    struct.pack_into('<IIII', outer, 60, 64, 2 << 16, len(outer), signed_size)
+    return bytes(outer) + signature_block + type6_header + block_header + ciphertext
 
 
 def decrypt_internal_config(blob: bytes, gpon_sn: str, router_mac: str) -> bytes:
@@ -544,7 +440,7 @@ class Router:
 
 
 def backup_password_new() -> str:
-    """Only used in RAM: both downloads are decrypted before this program exits."""
+    """Generate a strong password that fits the WEB backup form."""
     alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
     return 'Zb4' + ''.join(secrets.choice(alphabet) for _ in range(21))
 
@@ -1229,21 +1125,16 @@ def pack_xml_file(filename: Path, xml: bytes) -> int:
     Progress.title('ZTE WEB backup - packing')
     output = filename.with_suffix('.repacked.cfg')
     try:
-        source = input('    > Original WEB backup (.cfg) from this router: ').strip().strip('"')
-        if not source:
-            raise ValueError('Original WEB backup is required')
-        template = Path(source).expanduser().read_bytes()
-        password = getpass('    > Password for the original WEB backup: ')
-        if not password:
-            raise ValueError('Backup password is required')
-        backup = pack_web_backup(xml, template, password)
+        password = backup_password_new()
+        backup = pack_web_backup(xml, password)
         safe_write(output, backup)
-        Progress.ok(f'Verified WEB backup: {output.resolve()}')
+        Progress.ok(f'Created WEB backup: {output.resolve()}')
+        Progress.action(f'Password for WEB restore: {password}')
         return 0
     except FileExistsError:
         Progress.warn(f'Backup already exists: {output}')
         return 1
-    except (OSError, ValueError, LookupError, ET.ParseError, struct.error, zlib.error, EOFError) as exc:
+    except (OSError, ValueError, LookupError, ET.ParseError, zlib.error) as exc:
         Progress.warn(f'WEB backup packing failed: {type(exc).__name__}: {exc}')
         return 1
 

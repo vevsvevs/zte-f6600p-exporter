@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import hashlib
+import io
 import struct
 import tempfile
 import unittest
 import zlib
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 from xml.etree import ElementTree
@@ -14,102 +16,78 @@ import zte_f6600p_export as exporter
 
 
 PASSWORD = 'Example backup password'
-PREFIX = b'Board S/N: 5A54454700000000\r\n'
-CHUNK_SIZE = 128
+CHUNK_SIZE = 64 * 1024
 XML = b'<DB><Tbl name="Example"><Row No="0"><DM name="Label" val="%s"/></Row></Tbl></DB>'
 
 
-def cipher(password):
-    key = hashlib.sha256(password.encode()).digest()
-    iv = hashlib.sha256(b'ZTE%FN$GponNJ025').digest()[:16]
-    return Cipher(algorithms.AES(key), modes.CBC(iv))
-
-
-def make_template(xml, endian='>', pkcs7=False, flags=False):
-    chunks, crc = bytearray(), 0
-    for start in range(0, len(xml), CHUNK_SIZE):
-        clear = xml[start:start + CHUNK_SIZE]
-        compressed = zlib.compress(clear)
-        last_chunk_offset = 60 + len(chunks)
-        next_chunk = 0
-        if start + len(clear) < len(xml):
-            next_chunk = 1 if flags else last_chunk_offset + 12 + len(compressed)
-        chunks.extend(struct.pack('>III', len(clear), len(compressed), next_chunk) + compressed)
-        crc = zlib.crc32(compressed, crc)
-    compressed_size = 60 + len(chunks) if flags else last_chunk_offset
-    header = struct.pack('>6I', 0x01020304, 0, len(xml), compressed_size, CHUNK_SIZE, crc)
-    inner = header + struct.pack('>I', zlib.crc32(header)) + bytes(32) + chunks
-    pad_size = -len(inner) % 16
-    padding = bytes([pad_size or 16]) * (pad_size or 16) if pkcs7 else bytes(pad_size)
-    enc = cipher(PASSWORD).encryptor()
-    ciphertext = enc.update(inner + padding) + enc.finalize()
-    signed = struct.pack('>III', 0x04030201, 0, 7) + b'TestZTE'
-    signed += struct.pack('>18I', 0x01020304, 6, len(inner), len(ciphertext) + 72,
-                          *([0] * 11), len(inner), len(ciphertext), 0) + ciphertext
-    outer = bytearray(bytes.fromhex('999999994444444455555555aaaaaaaa') + bytes(112))
-    struct.pack_into(endian + 'I', outer, 24, 4)
-    struct.pack_into(endian + 'II', outer, 68, 128, len(signed))
-    return PREFIX + outer + signed
-
-
 class WebBackupTest(unittest.TestCase):
-    def test_rebuild_with_exact_multiple_of_chunk_size(self):
-        edited = XML % (b'B' * (4 * CHUNK_SIZE - len(XML % b'')))
-        for endian, pkcs7, flags in (('>', False, False), ('<', True, True)):
-            with self.subTest(endian=endian):
-                original = make_template(XML % (b'A' * 300), endian, pkcs7, flags)
-                result = exporter.pack_web_backup(edited, original, PASSWORD)
-                payload = len(PREFIX) + 128 + 12 + 7
-                self.assertEqual(result[:len(PREFIX)], PREFIX)
-                self.assertEqual(result[len(PREFIX) + 128:payload],
-                                 original[len(PREFIX) + 128:payload])
-                signed_size, = struct.unpack_from(endian + 'I', result, len(PREFIX) + 72)
-                self.assertEqual(signed_size, len(result) - len(PREFIX) - 128)
-                plain_size, cipher_size, following = struct.unpack_from('>III', result, payload + 60)
-                self.assertEqual((cipher_size, following), (len(result) - payload - 72, 0))
-                dec = cipher(PASSWORD).decryptor()
-                inner = (dec.update(result[payload + 72:]) + dec.finalize())[:plain_size]
-                header = struct.unpack_from('>15I', inner)
-                self.assertEqual(header[6], zlib.crc32(inner[:24]))
-                pos, crc, clear = 60, 0, bytearray()
-                for index in range(4):
-                    last_start = pos
-                    n_plain, n_z, next_chunk = struct.unpack_from('>III', inner, pos)
-                    compressed = inner[pos + 12:pos + 12 + n_z]
-                    crc = zlib.crc32(compressed, crc)
-                    clear.extend(zlib.decompress(compressed))
-                    pos += 12 + n_z
-                    self.assertEqual(n_plain, CHUNK_SIZE)
-                    self.assertEqual(next_chunk, 0 if index == 3 else (1 if flags else pos))
-                self.assertEqual((header[3], header[5], pos),
-                                 (len(inner) if flags else last_start, crc, len(inner)))
-                self.assertEqual(clear, edited)
+    def test_web_container_with_exact_multiple_of_chunk_size(self):
+        xml = XML % (b'B' * (2 * CHUNK_SIZE - len(XML % b'')))
+        blob = exporter.pack_web_backup(xml, PASSWORD)
+        self.assertEqual(blob[:16], bytes.fromhex('999999994444444455555555aaaaaaaa'))
+        self.assertEqual(struct.unpack_from('<II', blob, 68), (128, len(blob) - 128))
+        self.assertEqual(struct.unpack_from('>III', blob, 128), (0x04030201, 0, 6))
+        self.assertEqual(blob[140:146], b'F6600P')
+        payload_offset = 146
+        self.assertEqual(struct.unpack_from('>II', blob, payload_offset), (0x01020304, 6))
+        plain_size, cipher_size, following = struct.unpack_from('>III', blob, payload_offset + 60)
+        self.assertEqual((cipher_size, following), (len(blob) - payload_offset - 72, 0))
 
-    def test_invalid_xml_and_wrong_password(self):
-        xml = XML % b'original'
-        template = make_template(xml)
-        for edited, error in ((b'<DB>', ElementTree.ParseError),
-                              (b'<!DOCTYPE DB>' + xml, ValueError),
-                              (xml.replace(b'name="Label"', b'name="Other"'), ValueError)):
-            with self.subTest(error=error):
-                with self.assertRaises(error):
-                    exporter.pack_web_backup(edited, template, PASSWORD)
-        with self.assertRaises(ValueError):
-            exporter.pack_web_backup(xml, template, 'wrong password')
+        key = hashlib.sha256(PASSWORD.encode()).digest()
+        iv = hashlib.sha256(b'ZTE%FN$GponNJ025').digest()[:16]
+        dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        padded = dec.update(blob[payload_offset + 72:]) + dec.finalize()
+        inner = padded[:plain_size]
+        self.assertEqual(padded[plain_size:], bytes(-plain_size % 16))
+        header = struct.unpack_from('>15I', inner)
+        self.assertEqual(header[:3], (0x01020304, 0, len(xml)))
+        self.assertEqual(header[4], CHUNK_SIZE)
+        self.assertEqual(header[6], zlib.crc32(inner[:24]))
 
-    def test_offline_xml_output_and_collision(self):
+        pos, crc, clear = 60, 0, bytearray()
+        for last in (False, True):
+            last_start = pos
+            n_plain, n_z, next_chunk = struct.unpack_from('>III', inner, pos)
+            compressed = inner[pos + 12:pos + 12 + n_z]
+            crc = zlib.crc32(compressed, crc)
+            clear.extend(zlib.decompress(compressed))
+            pos += 12 + n_z
+            self.assertEqual(n_plain, CHUNK_SIZE)
+            self.assertEqual(next_chunk, 0 if last else pos)
+        self.assertEqual((header[3], header[5], pos), (last_start, crc, len(inner)))
+        self.assertEqual(clear, xml)
+        self.assertEqual(exporter.decrypt_backup(blob, PASSWORD), xml)
+
+    def test_xml_validation_checks_syntax_only(self):
+        for malformed in (b'<DB>', b'<DB value="x",/>', b'<DB>&broken</DB>'):
+            with self.subTest(xml=malformed):
+                with self.assertRaises(ElementTree.ParseError):
+                    exporter.pack_web_backup(malformed, PASSWORD)
+
+        xml = b'<!DOCTYPE Other [<!ENTITY name "example">]><Other>,&name;<Field /></Other>'
+        self.assertTrue(exporter.pack_web_backup(xml, PASSWORD))
+
+    def test_offline_xml_output_without_any_prompts(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            template = path / 'original.cfg'
-            template.write_bytes(make_template(XML % b'old'))
-            source = path / 'edited'
+            source = Path(directory) / 'edited'
             source.write_bytes(b'\xef\xbb\xbf<!-- edited -->' + XML % b'new')
-            with patch('builtins.input', return_value=str(template)), \
-                    patch.object(exporter, 'getpass', return_value=PASSWORD):
+            with patch('builtins.input', side_effect=AssertionError('Unexpected prompt')), \
+                    redirect_stdout(io.StringIO()) as terminal:
                 self.assertEqual(exporter.offline(source), 0)
                 self.assertEqual(exporter.offline(source), 1)
-            result = path / 'edited.repacked.cfg'
-            self.assertEqual(exporter.decrypt_backup(result.read_bytes(), PASSWORD), source.read_bytes())
+            password_line = 'Password for WEB restore: '
+            self.assertEqual(terminal.getvalue().count(password_line), 1)
+            password = terminal.getvalue().partition(password_line)[2].splitlines()[0]
+            result = source.with_suffix('.repacked.cfg')
+            self.assertEqual(exporter.decrypt_backup(result.read_bytes(), password), source.read_bytes())
+
+    def test_malformed_xml_does_not_write_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'bad.xml'
+            source.write_text('<DB, />', encoding='utf-8')
+            with patch('builtins.input', side_effect=AssertionError('Unexpected prompt')):
+                self.assertEqual(exporter.offline(source), 1)
+            self.assertFalse(source.with_suffix('.repacked.cfg').exists())
 
     def test_native_database_with_xml_extension_still_uses_native_mode(self):
         with tempfile.TemporaryDirectory() as directory:

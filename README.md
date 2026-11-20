@@ -14,11 +14,11 @@ Decrypts a previously saved ZTE Type 6 web backup or internal configuration data
 
 ### Offline WEB backup packing
 
-Pass a WEB configuration XML file as the sole argument. The tool asks for an original Type 6 WEB backup from the target router and that backup's password. It reuses the router's backup header, then compresses and encrypts the XML using that password. The tool decrypts its output and checks it against the input bytes before writing `<name>.repacked.cfg` next to the XML. If that output already exists, choose a different XML filename or move the previous output.
+Pass a WEB configuration XML file as the sole argument. The tool builds a ZTE F6600P Type 6 container, writes `<name>.repacked.cfg` next to the XML, and prints the newly generated backup password. Use that password for WEB restore. If the output already exists, choose a different XML filename or move the previous output.
 
-Start with a copy of the WEB XML exported from the same router and firmware. Use a template exported with the same WEB account level. If you obtained `webcfg_dbase.xml` in online mode, use a fresh WEB backup saved in the browser as the template. Online mode exports the full WEB XML as administrator. The Telnet XML and the router's native Type 6 database are separate formats for this workflow.
+Start with a copy of `webcfg_dbase.xml` from the target router. Preserve the original XML encoding when editing. The packer checks XML syntax and reports the line and column of a syntax error. A comma after an attribute's closing quote is invalid, while a comma inside a quoted value or in element text is valid XML. The packer preserves the original bytes. Firmware-specific checks happen during restore.
 
-The tool requires well-formed XML without a DTD and compares the element order, table and field names, row counts, and attribute names with the template's decrypted XML. Preserve the original XML encoding when editing. The tool accepts changes to setting values. Firmware-specific constraints and linked settings require verification on the device.
+The packer generates the documented ZTE container header from scratch. Compatibility with any additional header metadata required by the Vodafone V14 WEB importer still needs to be verified on the router.
 
 ## Download and usage
 
@@ -53,14 +53,15 @@ For offline decryption, pass the backup filename as the first argument. To try p
 python zte_f6600p_export.py edited.xml
 ```
 
-Enter the path to the original `.cfg` and its backup password at the prompts. When the firmware asks for the backup password during WEB restore, enter that same password.
+The packing command runs without prompts. Copy the password printed in the terminal for the WEB restore.
 
 ## Verify a rebuilt backup
 
-1. In the WEB interface, download an original Type 6 backup (`before.cfg`) and keep it for recovery. Choose a reversible setting that leaves management access intact, such as the guest Wi-Fi network name while you are connected by Ethernet.
-2. Change that setting in the WEB interface, then download `after.cfg` with the same backup password. Decrypt both files with the script. Compare their `webcfg_dbase.xml` files to identify the exact field and any other changes made by the firmware.
-3. Copy the XML from `before.cfg` to `edited.xml` and apply the same setting change. Pack it using `before.cfg` as the template. Decrypt `edited.repacked.cfg` and compare its XML with the one from `after.cfg`, for example using `git diff --no-index` with the two XML paths. The changed field should match. Account for any additional changes that the router made in step 2. Compressed and encrypted files can differ byte for byte even when their XML is equivalent.
-4. Revert the test setting through the WEB interface so that it is back at its original value. Then restore `edited.repacked.cfg` through the WEB interface and verify that the new value takes effect. Keep `before.cfg` and its password at hand to restore the original settings.
+1. Download a backup through the WEB interface and keep it and its password for recovery.
+2. Edit a copy of the WEB XML and change a reversible setting, such as the guest Wi-Fi name while managing the router over Ethernet. Pack the edited XML with the command above.
+3. Restore `edited.repacked.cfg` through the WEB interface using the password printed by the tool. Check that the setting changed.
+
+For an optional byte-for-byte comparison, export the reference backup from the router using the same password printed by the tool. Compare the two files with `fc.exe /b` on Windows or `cmp` on Linux and macOS. Equality requires the same XML bytes, compression output, and header metadata.
 
 ## Security and limitations
 
