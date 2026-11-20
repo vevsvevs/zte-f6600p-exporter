@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ZTE F6600P configuration export and optional factory Telnet reader.
+"""ZTE F6600P configuration export, WEB backup packing, and factory Telnet reader.
 The script never reboots the router or changes its saved configuration.
 
 Factory-mode protocol adaptation references:
@@ -24,6 +24,7 @@ import struct
 import sys
 import time
 import zlib
+from getpass import getpass
 from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -39,6 +40,8 @@ MAGIC = bytes.fromhex('999999994444444455555555aaaaaaaa')
 ZTE_IV = b'ZTE%FN$GponNJ025'
 PAYLOAD_MAGIC = 0x01020304
 SIG_MAGIC = 0x04030201
+MAX_CONFIG_SIZE = 32_000_000
+MAX_CONFIG_CHUNKS = 1024
 TIMEOUT = (5, 25)
 DEFAULT_PROFILE = 'vodafone_v14'
 
@@ -107,7 +110,7 @@ def safe_write(path: Path, contents: bytes) -> None:
         raise
 
 
-def unpack_zte_chunks(inner: bytes, max_size: int = 32_000_000) -> bytes:
+def unpack_zte_chunks(inner: bytes, max_size: int = MAX_CONFIG_SIZE) -> bytes:
     """Unpack the shared ZTE payload format and check CRC/length."""
     if len(inner) < 72:
         raise ValueError('Decrypted ZTE payload is too short')
@@ -118,7 +121,7 @@ def unpack_zte_chunks(inner: bytes, max_size: int = 32_000_000) -> bytes:
         raise ValueError('Decompressed configuration exceeds size limit')
 
     pos, crc, output = 60, 0, bytearray()
-    for _ in range(1024):
+    for _ in range(MAX_CONFIG_CHUNKS):
         if pos + 12 > len(inner):
             raise ValueError('Truncated compressed ZTE chunk')
         n_plain, n_z, cont = struct.unpack_from('>III', inner, pos)
@@ -151,7 +154,8 @@ def unpack_zte_chunks(inner: bytes, max_size: int = 32_000_000) -> bytes:
     return bytes(output)
 
 
-def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
+def web_backup_layout(blob: bytes) -> tuple[int, int, int, int]:
+    """Return container start, Type-6 header offset, inner size and cipher size."""
     i = blob.find(MAGIC)
     if i < 0:
         raise ValueError('Type 6 ZTE container not found')
@@ -165,6 +169,7 @@ def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
     if not re.fullmatch(r'[A-Za-z0-9_.-]{3,128}', signature):
         raise ValueError(f'Unexpected ZTE signature {signature!r}')
     offset += siglen
+    payload_offset = offset
     header = struct.unpack_from('>15I', data, offset)
     if header[:2] != (PAYLOAD_MAGIC, 6):
         raise ValueError('Expected ZTE Type 6 payload')
@@ -174,11 +179,157 @@ def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
     if (next_chunk != 0 or cipherlen % 16 != 0 or origlen > cipherlen
             or offset+cipherlen > len(data) or origlen < 60):
         raise ValueError('Unexpected ciphertext layout')
-    key = hashlib.sha256(backup_password.encode('utf-8')).digest()
+    return i, i + payload_offset, origlen, cipherlen
+
+
+def web_backup_cipher(password: str) -> Cipher:
+    key = hashlib.sha256(password.encode('utf-8')).digest()
     iv = hashlib.sha256(ZTE_IV).digest()[:16]
-    dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-    inner = (dec.update(bytes(data[offset:offset+cipherlen])) + dec.finalize())[:origlen]
-    return unpack_zte_chunks(inner)
+    return Cipher(algorithms.AES(key), modes.CBC(iv))
+
+
+def decrypt_web_payload(ciphertext: bytes, password: str) -> bytes:
+    dec = web_backup_cipher(password).decryptor()
+    return dec.update(ciphertext) + dec.finalize()
+
+
+def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
+    _, payload, inner_size, cipher_size = web_backup_layout(blob)
+    start = payload + 72
+    data = decrypt_web_payload(blob[start:start + cipher_size], backup_password)
+    return unpack_zte_chunks(data[:inner_size])
+
+
+class ConfigTreeBuilder(ET.TreeBuilder):
+    def doctype(self, name: str, pubid: str | None, system: str | None) -> None:
+        raise ValueError('DOCTYPE declarations are not allowed in WEB configuration XML')
+
+
+def parse_web_xml(xml: bytes) -> ET.Element:
+    if len(xml) > MAX_CONFIG_SIZE:
+        raise ValueError('XML exceeds the configuration size limit')
+    root = ET.fromstring(xml, parser=ET.XMLParser(target=ConfigTreeBuilder()))
+    if root.tag != 'DB' or not len(root):
+        raise ValueError('Expected a nonempty ZTE XML database with a DB root')
+    return root
+
+
+def validate_web_xml(root: ET.Element, original: ET.Element) -> None:
+    """Compare structure without comparing settings, row indices or other data values."""
+    pending = [(root, original, '/DB')]
+    while pending:
+        current, expected, location = pending.pop()
+        if (current.tag != expected.tag or current.attrib.keys() != expected.attrib.keys()
+                or current.attrib.get('name') != expected.attrib.get('name')
+                or len(current) != len(expected)):
+            raise ValueError(f'XML structure differs from the WEB backup at {location}')
+        if len(current) and ((current.text or '').strip()
+                             or any((child.tail or '').strip() for child in current)):
+            raise ValueError(f'Unexpected text between XML elements at {location}')
+        for index in reversed(range(len(current))):
+            child = expected[index]
+            pending.append((current[index], child, f'{location}/{child.tag}[{index + 1}]'))
+
+
+def pack_zte_chunks(xml: bytes, template: bytes) -> bytes:
+    """Rebuild the compressed payload using the template's chunk and CRC conventions."""
+    header = list(struct.unpack_from('>15I', template))
+    chunk_size = header[4]
+    if (not 0 < chunk_size <= MAX_CONFIG_SIZE
+            or (len(xml) + chunk_size - 1) // chunk_size > MAX_CONFIG_CHUNKS):
+        raise ValueError('Unsupported ZTE compression chunk size')
+
+    # Inspect the already verified original chunks for the length/continuation conventions.
+    pos, continuation = 60, set()
+    while True:
+        n_plain, n_z, following = struct.unpack_from('>III', template, pos)
+        if n_plain > chunk_size or (following and n_plain != chunk_size):
+            raise ValueError('Unsupported ZTE compression chunk boundaries')
+        last_start = pos
+        pos += 12 + n_z
+        if not following:
+            break
+        if following not in (1, pos):
+            raise ValueError('Unsupported ZTE compression continuation field')
+        continuation.add(following == 1)
+    if len(continuation) > 1 or header[3] not in (0, last_start, len(template)):
+        raise ValueError('Unsupported ZTE compression length fields')
+    if header[6] not in (0, zlib.crc32(template[:24])) or any(header[7:]):
+        raise ValueError('Unsupported ZTE compression header')
+
+    crc, payload = 0, bytearray()
+    for start in range(0, len(xml), chunk_size):
+        block = xml[start:start + chunk_size]
+        compressed = zlib.compress(block, level=9)
+        last_start = 60 + len(payload)
+        following = 0
+        if start + len(block) < len(xml):
+            following = 1 if True in continuation else last_start + 12 + len(compressed)
+        payload.extend(struct.pack('>III', len(block), len(compressed), following))
+        payload.extend(compressed)
+        crc = zlib.crc32(compressed, crc)
+
+    header[2], header[5] = len(xml), crc
+    if header[3]:
+        header[3] = 60 + len(payload) if header[3] == len(template) else last_start
+    if header[6]:
+        header[6] = zlib.crc32(struct.pack('>6I', *header[:6]))
+    return struct.pack('>15I', *header) + payload
+
+
+def pack_web_backup(xml: bytes, template: bytes, password: str) -> bytes:
+    """Pack WEB XML against a backup from the target router."""
+    root = parse_web_xml(xml)
+    container, payload, inner_size, cipher_size = web_backup_layout(template)
+    start = payload + 72
+    if start + cipher_size != len(template):
+        raise ValueError('Unsupported data after the WEB backup ciphertext')
+
+    # Signed payload size counts from the end of the 128-byte container header.
+    old_size = len(template) - container - 128
+    for endian in ('>', '<'):
+        version, = struct.unpack_from(endian + 'I', template, container + 24)
+        header_size, signed_size = struct.unpack_from(endian + 'II', template, container + 68)
+        if (version, header_size, signed_size) == (4, 128, old_size):
+            break
+    else:
+        raise ValueError('Unsupported WEB backup container header')
+
+    padded = decrypt_web_payload(template[start:], password)
+    inner = padded[:inner_size]
+    original = unpack_zte_chunks(inner)
+    validate_web_xml(root, parse_web_xml(original))
+    packed = pack_zte_chunks(xml, inner)
+
+    pad = padded[inner_size:]
+    if len(pad) < 16 and not any(pad):
+        padding = bytes(-len(packed) % 16)
+    elif 1 <= len(pad) <= 16 and pad == bytes([len(pad)]) * len(pad):
+        pad_size = 16 - len(packed) % 16
+        padding = bytes([pad_size]) * pad_size
+    else:
+        raise ValueError('Unsupported WEB backup AES padding')
+    enc = web_backup_cipher(password).encryptor()
+    ciphertext = enc.update(packed + padding) + enc.finalize()
+
+    encrypted_header = list(struct.unpack_from('>15I', template, payload))
+    if any(encrypted_header[5:]) or encrypted_header[2] not in (0, inner_size):
+        raise ValueError('Unsupported WEB backup encryption header')
+    if encrypted_header[3] not in (0, cipher_size + 72):
+        raise ValueError('Unsupported WEB backup encrypted block size field')
+    if encrypted_header[2]:
+        encrypted_header[2] = len(packed)
+    if encrypted_header[3]:
+        encrypted_header[3] = len(ciphertext) + 72
+
+    preamble = bytearray(template[:payload])
+    struct.pack_into(endian + 'I', preamble, container + 72,
+                     old_size - cipher_size + len(ciphertext))
+    header = struct.pack('>18I', *encrypted_header, len(packed), len(ciphertext), 0)
+    result = bytes(preamble) + header + ciphertext
+    if decrypt_backup(result, password) != xml:
+        raise ValueError('WEB backup verification failed')
+    return result
 
 
 
@@ -1074,25 +1225,50 @@ def save_config(out: Path, xml: bytes, blob: bytes,
     Progress.ok('webcfg_dbase.xml, webcfg_creds.txt')
 
 
+def pack_xml_file(filename: Path, xml: bytes) -> int:
+    Progress.title('ZTE WEB backup - packing')
+    output = filename.with_suffix('.repacked.cfg')
+    try:
+        source = input('    > Original WEB backup (.cfg) from this router: ').strip().strip('"')
+        if not source:
+            raise ValueError('Original WEB backup is required')
+        template = Path(source).expanduser().read_bytes()
+        password = getpass('    > Password for the original WEB backup: ')
+        if not password:
+            raise ValueError('Backup password is required')
+        backup = pack_web_backup(xml, template, password)
+        safe_write(output, backup)
+        Progress.ok(f'Verified WEB backup: {output.resolve()}')
+        return 0
+    except FileExistsError:
+        Progress.warn(f'Backup already exists: {output}')
+        return 1
+    except (OSError, ValueError, LookupError, ET.ParseError, struct.error, zlib.error, EOFError) as exc:
+        Progress.warn(f'WEB backup packing failed: {type(exc).__name__}: {exc}')
+        return 1
+
+
 def offline(filename: Path) -> int:
-    Progress.title('ZTE configuration export - offline')
-    Progress.stage(1, 'Decrypting and validating configuration')
     if not filename.is_file():
         Progress.warn('Backup file not found.')
         return 1
     try:
         blob = filename.read_bytes()
         native = blob[:8] == struct.pack('>II', PAYLOAD_MAGIC, 6)
-        raw_xml = blob.lstrip().startswith((b'<?xml', b'<DB'))
+        looks_like_xml = blob.removeprefix(codecs.BOM_UTF8).lstrip().startswith(b'<')
+        xml_bom = blob.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE,
+                                   codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE))
+        if not native and MAGIC not in blob and (
+                looks_like_xml or xml_bom or filename.suffix.lower() == '.xml'):
+            return pack_xml_file(filename, blob)
+
+        Progress.title('ZTE configuration export - offline')
+        Progress.stage(1, 'Decrypting and validating configuration')
         if native:
             serial = input('    > GPON serial (ZTEG...): ').strip()
             mac = input('    > Router MAC1: ').strip()
             xml = decrypt_internal_config(blob, serial, mac)
             name = 'telnet_dbase.xml'
-        elif raw_xml:
-            xml = blob
-            ET.fromstring(xml)
-            name = 'webcfg_dbase.xml'
         else:
             password = input('    > Backup password: ')
             if not password:
@@ -1334,9 +1510,9 @@ def online(profile_name: str = DEFAULT_PROFILE) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Export ZTE configuration and collect internal Telnet data when available.')
+        description='Export ZTE configuration or pack WEB XML into a Type-6 backup.')
     parser.add_argument('backup', nargs='?', type=Path,
-                        help='Existing .cfg, native Type-6 database, or XML (offline mode).')
+                        help='Offline input: WEB .cfg or native Type-6 DB to decrypt, WEB XML to pack.')
     parser.add_argument('--profile', choices=sorted(WEB_PROFILES), default=DEFAULT_PROFILE,
                         help='WEB endpoint profile (online mode).')
     args = parser.parse_args()
