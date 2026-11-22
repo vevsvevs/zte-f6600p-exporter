@@ -1,78 +1,73 @@
 # ZTE F6600P Configuration Exporter
 
-A small command-line tool for exporting and decrypting configuration data from supported ZTE routers and rebuilding encrypted WEB backups from exported XML. The export modes were developed and tested with a **ZTE ZXHN F6600P running Vodafone Spain firmware V9.1.10P5N20 (V14)**. Restoring a rebuilt backup on that firmware is pending hardware verification.
+Export and inspect your router's configuration, decrypt a saved backup offline, or rebuild a WEB backup from edited XML. The export modes were tested on the **ZTE ZXHN F6600P with Vodafone Spain firmware V9.1.10P5N20 (V14)**. Restoring rebuilt backups on that firmware still needs hardware verification. Compatibility with other firmware versions and router models may vary.
 
-## Modes
+## Getting started
 
-### Online mode
+Download **`ZTE-F6600P-Export.exe`** for Windows x64 and open PowerShell in the download folder. The executable runs without a Python installation. Windows SmartScreen may show a warning because the executable is unsigned. [Releases](../../releases/latest)
 
-Connects to the router, downloads and decrypts its web configuration, and creates a readable credentials report. It then uses temporary Factory Telnet (or an existing Telnet session) to collect GPON information and decrypt the internal configuration database. At the end, you can choose to **leave Telnet enabled**; by default, the tool attempts to close it. If Telnet is unavailable, the web configuration export may still succeed.
-
-### Offline decryption
-
-Decrypts a previously saved ZTE Type 6 web backup or internal configuration database **without connecting to the router**. Web backups also produce a credentials report.
-
-### Offline WEB backup packing
-
-Pass a WEB configuration XML file or an export directory as the sole argument. For a directory, the tool reads `webcfg_dbase.xml` inside it. The tool writes `<name>_repacked.cfg` next to the source XML. If that backup already exists, the tool stops before prompting.
-
-1. At the password prompt, enter a nonempty password for the new backup. The characters you type are visible in the terminal. Use the same password for WEB restore.
-2. At the GPON serial prompt, enter the four-letter vendor ID followed by eight hexadecimal digits, such as `ZTEG12345678`. The tool looks for `telnet_show2.txt` in the supplied directory or beside the supplied XML. It uses the full `GPONSN` when present, or combines `VENDORID` with an eight-digit `GPONSN` suffix. Press Enter to accept the serial shown in brackets, or type a different one. If the file is missing or contains no usable serial, enter the full serial manually.
-
-Start with a copy of `webcfg_dbase.xml` from the target router. Preserve the original XML encoding when editing. The packer checks XML syntax and reports the line and column of a syntax error. A comma after an attribute's closing quote is invalid, while a comma inside a quoted value or in element text is valid XML. The packer preserves the original bytes. Firmware-specific checks happen during restore.
-
-The backup begins with `Board S/N:` immediately followed by 16 uppercase hexadecimal digits encoding the four ASCII vendor bytes and four serial bytes. A single LF byte (`0x0A`) follows the serial, immediately before the ZTE Type 6 container. Compatibility with any additional header metadata required by the Vodafone V14 WEB importer still needs to be verified on the router.
-
-## Download and usage
-
-Download **`ZTE-F6600P-Export.exe`** from [Releases](../../releases/latest) (Windows x64). No Python installation is required for this executable.
-
-Open Windows Terminal in the folder containing the downloaded file and run:
-
-```powershell
-.\ZTE-F6600P-Export.exe
-```
-
-For offline decryption:
-
-```powershell
-.\ZTE-F6600P-Export.exe configurationBackup.cfg
-```
-
-The export modes prompt for required credentials and save their files in newly created local folders. If you keep temporary Telnet enabled in online mode, reboot the router afterward and verify that access is no longer available.
-
-### Run from source
-
-Requires Python 3.11+:
+To run from source, use Python 3.11 or later.
 
 ```bash
 python -m pip install requests cryptography psutil
 python zte_f6600p_export.py
 ```
 
-For offline decryption, pass the backup filename as the first argument. For packing, use either form below.
+For the examples below, replace `.\ZTE-F6600P-Export.exe` with `python zte_f6600p_export.py` when running from source. Passwords are visible as you type.
+
+## Export from the router
+
+Connect to the router's local network and run the tool without arguments.
+
+```powershell
+.\ZTE-F6600P-Export.exe
+```
+
+Enter the router's private IPv4 address and WEB login. Press Enter to accept `192.168.1.1` and `user` if they match your setup. The tool downloads and decrypts the WEB configuration, then tries to collect the internal configuration over Telnet. It uses an existing Telnet service if available and asks for its credentials. Otherwise, it attempts to open temporary Factory Telnet access.
+
+The tool prints the path to the new `zte_export_...` folder in the working directory.
+
+| File | Contents |
+| --- | --- |
+| `webcfg_dbase.xml` | Decrypted WEB configuration. Use this XML as the starting point for rebuilding a WEB backup. |
+| `webcfg_creds.txt` | Readable credentials report, which can include administrator, Wi-Fi, PPPoE, and SIP details. |
+| `telnet_show2.txt` | Telnet readout or status. When available, the readout includes the router's GPON serial and MAC1. |
+| `telnet_dbase.xml` | Decrypted internal configuration, available when Telnet collection and decryption succeed. |
+| `telnet_creds.txt` | Connection details the tool can save if you keep Telnet open or the close request fails. |
+
+If Telnet collection fails, you can still use the WEB files from a successful WEB export. By default, the tool requests closure of confirmed Telnet access. Check that access is disabled after you finish.
+
+## Decrypt an existing backup offline
+
+Pass the file to the tool. This mode works without a router connection.
+
+```powershell
+.\ZTE-F6600P-Export.exe .\configurationBackup.cfg
+```
+
+- **WEB backup**. Enter the backup password. The tool saves `webcfg_dbase.xml` and `webcfg_creds.txt` in a new `zte_export_...` folder.
+- **Native Type 6 database**. Pass the database file and enter the router's GPON serial and MAC1, if available from its Telnet readout. The tool saves the decrypted database as `telnet_dbase.xml` in a new export folder.
+
+## Rebuild a WEB backup
+
+> **Warning.** Uploading a modified configuration can overwrite settings, interrupt Internet or voice service, or lock you out of the router. Before restoring, save a known-good backup and its password and make sure you have a recovery method. Use a wired connection when testing changes to Wi-Fi or network settings. Restore at your own risk.
+
+Edit a copy of `webcfg_dbase.xml` from the target router and keep its original XML encoding. Run this branch from source and pass either the XML file or an export folder containing `webcfg_dbase.xml`.
 
 ```bash
 python zte_f6600p_export.py edited.xml
 python zte_f6600p_export.py ./export-directory
 ```
 
-The first command writes `edited_repacked.cfg` next to `edited.xml`. The second writes `webcfg_dbase_repacked.cfg` inside `export-directory`.
+Choose a password for the new backup, then enter the router's GPON serial. Press Enter to accept the serial suggested from `telnet_show2.txt` in the same folder, if available. Otherwise, enter the full serial, for example `ZTEG12345678`.
 
-## Verify a rebuilt backup
+The tool checks XML syntax and saves a new `*_repacked.cfg` beside the XML. It refuses to overwrite an existing backup. To apply the file, use the router's WEB restore page and the password you chose during packing.
 
-1. Download a backup through the WEB interface and keep it and its password for recovery.
-2. Edit a copy of the WEB XML and change a reversible setting, such as the guest Wi-Fi name while managing the router over Ethernet. Pack the edited XML with the command above.
-3. Restore `edited_repacked.cfg` through the WEB interface using the password you entered during packing. Check that the setting changed.
+## Responsible use and affiliation
 
-For an optional byte-for-byte comparison, export the reference backup from the router using the password you entered during packing. Compare the two files with `fc.exe /b` on Windows or `cmp` on Linux and macOS. Equality requires the same XML bytes, compression output, and header metadata.
+Use the tool only on equipment you own or have permission to administer. Keep decrypted exports, credentials reports, and Telnet files private. They can contain passwords and subscriber or device information.
 
-## Security and limitations
-
-- **Use only on equipment you own or administer with permission.**
-- Output files may contain sensitive credentials, including administrator, PPPoE, SIP, and Wi-Fi passwords. **Never upload your configuration exports, HAR files, or credentials to a public repository.**
-- The executable is currently unsigned; Windows may show a SmartScreen warning. Inspect the source and download only from a release you trust.
-- This is an independent, unofficial project, not affiliated with ZTE or Vodafone. Use at your own risk.
+This is an independent, unofficial project. ZTE and Vodafone are unaffiliated with the project and provide no endorsement or support for it. Product and brand names are used to identify the router and firmware.
 
 ## Credits, AI disclosure, and license
 
