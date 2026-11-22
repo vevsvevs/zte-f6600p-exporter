@@ -12,7 +12,6 @@ import argparse
 import datetime
 import base64
 import codecs
-import getpass
 import hashlib
 import html
 import ipaddress
@@ -1151,8 +1150,7 @@ def pack_xml_file(filename: Path, xml: bytes) -> int:
         # Skip compression on a repeat run. safe_write also handles concurrent writers.
         if output.exists():
             raise FileExistsError(output)
-        read_password = getpass.getpass if sys.stdin.isatty() else input
-        password = read_password('    > Password for WEB restore: ')
+        password = input('    > Password for WEB restore: ')
         if not password:
             raise ValueError('Backup password is required')
         backup = pack_web_backup(xml, password)
