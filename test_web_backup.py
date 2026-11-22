@@ -2,6 +2,8 @@
 import hashlib
 import io
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -69,17 +71,21 @@ class WebBackupTest(unittest.TestCase):
 
     def test_offline_xml_output_without_any_prompts(self):
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / 'edited'
-            source.write_bytes(b'\xef\xbb\xbf<!-- edited -->' + XML % b'new')
-            with patch('builtins.input', side_effect=AssertionError('Unexpected prompt')), \
-                    redirect_stdout(io.StringIO()) as terminal:
-                self.assertEqual(exporter.offline(source), 0)
-                self.assertEqual(exporter.offline(source), 1)
-            password_line = 'Password for WEB restore: '
-            self.assertEqual(terminal.getvalue().count(password_line), 1)
-            password = terminal.getvalue().partition(password_line)[2].splitlines()[0]
-            result = source.with_suffix('.repacked.cfg')
-            self.assertEqual(exporter.decrypt_backup(result.read_bytes(), password), source.read_bytes())
+            for name, output in (('settings.xml', 'settings_repacked.cfg'),
+                                 ('guest сеть.v2.XML', 'guest сеть.v2_repacked.cfg'),
+                                 ('edited', 'edited_repacked.cfg')):
+                with self.subTest(name=name):
+                    source = Path(directory) / name
+                    source.write_bytes(b'\xef\xbb\xbf<!-- edited -->' + XML % b'new')
+                    with patch('builtins.input', side_effect=AssertionError('Unexpected prompt')), \
+                            redirect_stdout(io.StringIO()) as terminal:
+                        self.assertEqual(exporter.offline(source), 0)
+                        self.assertEqual(exporter.offline(source), 1)
+                    password_line = 'Password for WEB restore: '
+                    self.assertEqual(terminal.getvalue().count(password_line), 1)
+                    password = terminal.getvalue().partition(password_line)[2].splitlines()[0]
+                    result = Path(directory) / output
+                    self.assertEqual(exporter.decrypt_backup(result.read_bytes(), password), source.read_bytes())
 
     def test_malformed_xml_does_not_write_backup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,7 +93,23 @@ class WebBackupTest(unittest.TestCase):
             source.write_text('<DB, />', encoding='utf-8')
             with patch('builtins.input', side_effect=AssertionError('Unexpected prompt')):
                 self.assertEqual(exporter.offline(source), 1)
-            self.assertFalse(source.with_suffix('.repacked.cfg').exists())
+            self.assertFalse(source.with_name('bad_repacked.cfg').exists())
+
+    def test_cli_invalid_input_and_closed_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'example.cfg'
+            for data, message, needs_password in (
+                    (b'', 'Input file is empty', False),
+                    (b'random text', 'Unrecognized file format', False),
+                    (exporter.pack_web_backup(XML % b'test', PASSWORD), 'Input closed', True)):
+                with self.subTest(message=message):
+                    source.write_bytes(data)
+                    result = subprocess.run([sys.executable, exporter.__file__, str(source)],
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual('Backup password:' in result.stdout, needs_password)
 
     def test_native_database_with_xml_extension_still_uses_native_mode(self):
         with tempfile.TemporaryDirectory() as directory:

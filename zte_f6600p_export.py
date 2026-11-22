@@ -104,7 +104,7 @@ def safe_write(path: Path, contents: bytes) -> None:
     try:
         with os.fdopen(fd, 'wb') as out:
             out.write(contents)
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         path.unlink(missing_ok=True)
         raise
 
@@ -1082,11 +1082,13 @@ def new_output_dir() -> Path:
     stamp = datetime.datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')
     base = Path.cwd() / ('zte_export_' + stamp)
     folder, n = base, 1
-    while folder.exists():
-        folder = Path(str(base) + '_' + str(n))
-        n += 1
-    folder.mkdir(mode=0o700)
-    return folder
+    while True:
+        try:
+            folder.mkdir(mode=0o700)
+            return folder
+        except FileExistsError:
+            folder = base.with_name(f'{base.name}_{n}')
+            n += 1
 
 
 def _read_status(router: Router) -> dict[str, str]:
@@ -1123,8 +1125,11 @@ def save_config(out: Path, xml: bytes, blob: bytes,
 
 def pack_xml_file(filename: Path, xml: bytes) -> int:
     Progress.title('ZTE WEB backup - packing')
-    output = filename.with_suffix('.repacked.cfg')
+    output = filename.with_name(f'{filename.stem}_repacked.cfg')
     try:
+        # Skip compression on a repeat run. safe_write also handles concurrent writers.
+        if output.exists():
+            raise FileExistsError(output)
         password = backup_password_new()
         backup = pack_web_backup(xml, password)
         safe_write(output, backup)
@@ -1139,23 +1144,33 @@ def pack_xml_file(filename: Path, xml: bytes) -> int:
         return 1
 
 
+def offline_input_kind(filename: Path, blob: bytes) -> str:
+    if not blob:
+        raise ValueError(f'Input file is empty: {filename}')
+    if blob.startswith(struct.pack('>II', PAYLOAD_MAGIC, 6)):
+        return 'native'
+    if MAGIC in blob:
+        return 'web'
+    # The extension also routes malformed XML to the parser for a line/column error.
+    if (filename.suffix.lower() == '.xml' or re.match(rb'\s*<', blob)
+            or blob.startswith((codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE,
+                                codecs.BOM_UTF32_BE, b'\x00<'))):
+        return 'xml'
+    raise ValueError(f'Unrecognized file format: {filename}')
+
+
 def offline(filename: Path) -> int:
-    if not filename.is_file():
-        Progress.warn('Backup file not found.')
-        return 1
     try:
+        if not filename.is_file():
+            raise ValueError(f'Expected an existing input file: {filename}')
         blob = filename.read_bytes()
-        native = blob[:8] == struct.pack('>II', PAYLOAD_MAGIC, 6)
-        looks_like_xml = blob.removeprefix(codecs.BOM_UTF8).lstrip().startswith(b'<')
-        xml_bom = blob.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE,
-                                   codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE))
-        if not native and MAGIC not in blob and (
-                looks_like_xml or xml_bom or filename.suffix.lower() == '.xml'):
+        kind = offline_input_kind(filename, blob)
+        if kind == 'xml':
             return pack_xml_file(filename, blob)
 
         Progress.title('ZTE configuration export - offline')
         Progress.stage(1, 'Decrypting and validating configuration')
-        if native:
+        if kind == 'native':
             serial = input('    > GPON serial (ZTEG...): ').strip()
             mac = input('    > Router MAC1: ').strip()
             xml = decrypt_internal_config(blob, serial, mac)
@@ -1168,7 +1183,7 @@ def offline(filename: Path) -> int:
             name = 'webcfg_dbase.xml'
         out = new_output_dir()
         safe_write(out / name, xml)
-        if native:
+        if kind == 'native':
             Progress.ok(name)
         else:
             safe_write(out / 'webcfg_creds.txt',
@@ -1418,3 +1433,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('\nInterrupted.', file=sys.stderr)
         raise SystemExit(130)
+    except EOFError:
+        Progress.warn('Input closed before all required answers were entered.')
+        raise SystemExit(1)

@@ -14,7 +14,7 @@ Decrypts a previously saved ZTE Type 6 web backup or internal configuration data
 
 ### Offline WEB backup packing
 
-Pass a WEB configuration XML file as the sole argument. The tool builds a ZTE F6600P Type 6 container, writes `<name>.repacked.cfg` next to the XML, and prints the newly generated backup password. Use that password for WEB restore. If the output already exists, choose a different XML filename or move the previous output.
+Pass a WEB configuration XML file as the sole argument. The tool builds a ZTE F6600P Type 6 container, writes `<name>_repacked.cfg` next to the XML, and prints the newly generated backup password. Use that password for WEB restore. If the output already exists, choose a different XML filename or move the previous output.
 
 Start with a copy of `webcfg_dbase.xml` from the target router. Preserve the original XML encoding when editing. The packer checks XML syntax and reports the line and column of a syntax error. A comma after an attribute's closing quote is invalid, while a comma inside a quoted value or in element text is valid XML. The packer preserves the original bytes. Firmware-specific checks happen during restore.
 
@@ -53,13 +53,13 @@ For offline decryption, pass the backup filename as the first argument. To try p
 python zte_f6600p_export.py edited.xml
 ```
 
-The packing command runs without prompts. Copy the password printed in the terminal for the WEB restore.
+This writes `edited_repacked.cfg` in the same folder. For example, `home.v2.xml` becomes `home.v2_repacked.cfg`. The packing command runs without prompts. Copy the password printed in the terminal for the WEB restore.
 
 ## Verify a rebuilt backup
 
 1. Download a backup through the WEB interface and keep it and its password for recovery.
 2. Edit a copy of the WEB XML and change a reversible setting, such as the guest Wi-Fi name while managing the router over Ethernet. Pack the edited XML with the command above.
-3. Restore `edited.repacked.cfg` through the WEB interface using the password printed by the tool. Check that the setting changed.
+3. Restore `edited_repacked.cfg` through the WEB interface using the password printed by the tool. Check that the setting changed.
 
 For an optional byte-for-byte comparison, export the reference backup from the router using the same password printed by the tool. Compare the two files with `fc.exe /b` on Windows or `cmp` on Linux and macOS. Equality requires the same XML bytes, compression output, and header metadata.
 
