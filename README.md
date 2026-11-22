@@ -14,11 +14,14 @@ Decrypts a previously saved ZTE Type 6 web backup or internal configuration data
 
 ### Offline WEB backup packing
 
-Pass a WEB configuration XML file as the sole argument. The tool builds a ZTE F6600P Type 6 container, writes `<name>_repacked.cfg` next to the XML, and encrypts it using the password you enter at the prompt. Use that password for WEB restore. If the output already exists, choose a different XML filename or move the previous output.
+Pass a WEB configuration XML file or an export directory as the sole argument. For a directory, the tool reads `webcfg_dbase.xml` inside it. The tool writes `<name>_repacked.cfg` next to the source XML. If that backup already exists, the tool stops before prompting.
+
+1. At the password prompt, enter a nonempty password for the new backup. The characters you type are visible in the terminal. Use the same password for WEB restore.
+2. At the GPON serial prompt, enter the four-letter vendor ID followed by eight hexadecimal digits, such as `ZTEG12345678`. The tool looks for `telnet_show2.txt` in the supplied directory or beside the supplied XML. It uses the full `GPONSN` when present, or combines `VENDORID` with an eight-digit `GPONSN` suffix. Press Enter to accept the serial shown in brackets, or type a different one. If the file is missing or contains no usable serial, enter the full serial manually.
 
 Start with a copy of `webcfg_dbase.xml` from the target router. Preserve the original XML encoding when editing. The packer checks XML syntax and reports the line and column of a syntax error. A comma after an attribute's closing quote is invalid, while a comma inside a quoted value or in element text is valid XML. The packer preserves the original bytes. Firmware-specific checks happen during restore.
 
-The packer generates the documented ZTE container header from scratch. Compatibility with any additional header metadata required by the Vodafone V14 WEB importer still needs to be verified on the router.
+The backup begins with `Board S/N:` immediately followed by 16 uppercase hexadecimal digits encoding the four ASCII vendor bytes and four serial bytes. A single LF byte (`0x0A`) follows the serial, immediately before the ZTE Type 6 container. Compatibility with any additional header metadata required by the Vodafone V14 WEB importer still needs to be verified on the router.
 
 ## Download and usage
 
@@ -47,15 +50,14 @@ python -m pip install requests cryptography psutil
 python zte_f6600p_export.py
 ```
 
-For offline decryption, pass the backup filename as the first argument. To try packing from this branch, run from source:
+For offline decryption, pass the backup filename as the first argument. For packing, use either form below.
 
 ```bash
 python zte_f6600p_export.py edited.xml
+python zte_f6600p_export.py ./export-directory
 ```
 
-This writes `edited_repacked.cfg` in the same folder. For example, `home.v2.xml` becomes `home.v2_repacked.cfg`. You can also pass an export directory to pack its `webcfg_dbase.xml`.
-
-During packing, the tool asks for the GPON serial to write into the backup's Board S/N header. It looks for `telnet_show2.txt` in the supplied directory or, for an XML argument, beside the XML. Press Enter to accept the serial shown in brackets, or type a different one. If the file is missing or contains no usable serial, enter the full serial manually (for example, `ZTEG12345678`).
+The first command writes `edited_repacked.cfg` next to `edited.xml`. The second writes `webcfg_dbase_repacked.cfg` inside `export-directory`.
 
 ## Verify a rebuilt backup
 
@@ -63,7 +65,7 @@ During packing, the tool asks for the GPON serial to write into the backup's Boa
 2. Edit a copy of the WEB XML and change a reversible setting, such as the guest Wi-Fi name while managing the router over Ethernet. Pack the edited XML with the command above.
 3. Restore `edited_repacked.cfg` through the WEB interface using the password you entered during packing. Check that the setting changed.
 
-For an optional byte-for-byte comparison, export the reference backup from the router using the same password printed by the tool. Compare the two files with `fc.exe /b` on Windows or `cmp` on Linux and macOS. Equality requires the same XML bytes, compression output, and header metadata.
+For an optional byte-for-byte comparison, export the reference backup from the router using the password you entered during packing. Compare the two files with `fc.exe /b` on Windows or `cmp` on Linux and macOS. Equality requires the same XML bytes, compression output, and header metadata.
 
 ## Security and limitations
 
