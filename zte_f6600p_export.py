@@ -12,6 +12,7 @@ import argparse
 import datetime
 import base64
 import codecs
+import getpass
 import hashlib
 import html
 import ipaddress
@@ -1150,14 +1151,16 @@ def pack_xml_file(filename: Path, xml: bytes) -> int:
         # Skip compression on a repeat run. safe_write also handles concurrent writers.
         if output.exists():
             raise FileExistsError(output)
-        password = backup_password_new()
+        read_password = getpass.getpass if sys.stdin.isatty() else input
+        password = read_password('    > Password for WEB restore: ')
+        if not password:
+            raise ValueError('Backup password is required')
         backup = pack_web_backup(xml, password)
         serial = ask_packing_serial(filename.parent)
         board_sn = serial[:4].encode('ascii') + bytes.fromhex(serial[4:])
-        header = f'Board S/N: {board_sn.hex().upper()}\r\n'.encode('ascii')
+        header = f'Board S/N:{board_sn.hex().upper()}\r\n'.encode('ascii')
         safe_write(output, header + backup)
         Progress.ok(f'Created WEB backup: {output.resolve()}')
-        Progress.action(f'Password for WEB restore: {password}')
         return 0
     except FileExistsError:
         Progress.warn(f'Backup already exists: {output}')
