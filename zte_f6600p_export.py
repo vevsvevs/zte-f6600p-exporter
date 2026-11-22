@@ -1156,7 +1156,7 @@ def pack_xml_file(filename: Path, xml: bytes) -> int:
         backup = pack_web_backup(xml, password)
         serial = ask_packing_serial(filename.parent)
         board_sn = serial[:4].encode('ascii') + bytes.fromhex(serial[4:])
-        header = f'Board S/N:{board_sn.hex().upper()}\r\n'.encode('ascii')
+        header = f'Board S/N:{board_sn.hex().upper()}\n'.encode('ascii')
         safe_write(output, header + backup)
         Progress.ok(f'Created WEB backup: {output.resolve()}')
         return 0
