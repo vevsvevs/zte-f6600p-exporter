@@ -4,7 +4,7 @@ Export and inspect your router's configuration, decrypt a saved backup offline, 
 
 ## Getting started
 
-Download **`ZTE-F6600P-Export.exe`** for Windows x64 and open PowerShell in the download folder. The executable runs without a Python installation. Windows SmartScreen may show a warning because the executable is unsigned. [Releases](../../releases/latest)
+Download **`ZTE-F6600P-Export.exe`** for Windows x64 and open a terminal in the download folder. The executable runs without a Python installation. Windows SmartScreen may show a warning because the executable is unsigned. [Releases](../../releases/latest)
 
 To run from source, use Python 3.11 or later.
 
@@ -13,13 +13,13 @@ python -m pip install requests cryptography psutil
 python zte_f6600p_export.py
 ```
 
-For the PowerShell examples below, replace `.\ZTE-F6600P-Export.exe` with `python zte_f6600p_export.py` when running from source.
+For the Windows commands below, replace `.\ZTE-F6600P-Export.exe` with `python zte_f6600p_export.py` when running from source.
 
 ## Export from the router
 
 Connect to the router's local network and run the tool without arguments.
 
-```powershell
+```text
 .\ZTE-F6600P-Export.exe
 ```
 
@@ -31,8 +31,8 @@ The tool prints the path to the new `zte_export_...` folder in the working direc
 | --- | --- |
 | `webcfg_dbase.xml` | Decrypted WEB configuration. Use this XML as the starting point for rebuilding a WEB backup. |
 | `webcfg_creds.txt` | Readable credentials report, which can include administrator, Wi-Fi, PPPoE, and SIP details. |
-| `telnet_show2.txt` | Output of `setmac show2`, which lists the router's internal device parameters (`TagParam`), including the GPON serial and MAC1. |
-| `telnet_dbase.xml` | Decrypted configuration database read over Telnet. It normally matches `webcfg_dbase.xml` byte for byte. |
+| `telnet_show2.txt` | Output of `setmac show2`, which lists internal device parameters such as `VENDORID`, `GPONSN`, `GPONPWD`, and `MAC1`. |
+| `telnet_dbase.xml` | Decrypted configuration database read over Telnet. It normally contains the same configuration as `webcfg_dbase.xml`, with a minor difference in a table header. |
 | `telnet_creds.txt` | Connection details the tool can save if you keep Telnet open or the close request fails. |
 
 If Telnet collection fails, you can still use the WEB files from a successful WEB export. By default, the tool requests closure of confirmed Telnet access. Check that access is disabled after you finish.
@@ -41,7 +41,7 @@ If Telnet collection fails, you can still use the WEB files from a successful WE
 
 Pass the file to the tool. This mode works without a router connection.
 
-```powershell
+```text
 .\ZTE-F6600P-Export.exe .\configurationBackup.cfg
 ```
 
@@ -52,11 +52,11 @@ Pass the file to the tool. This mode works without a router connection.
 
 > **Warning.** Uploading a modified configuration can overwrite settings, interrupt Internet or voice service, or lock you out of the router. Before restoring, save a known-good backup and its password and make sure you have a recovery method. Restore at your own risk.
 
-Edit a copy of `webcfg_dbase.xml` from the target router and keep its original XML encoding. Pass either the XML file or an export folder containing `webcfg_dbase.xml`.
+Save a backup copy of `webcfg_dbase.xml` from the target router, then edit the original file in the export folder, keeping its XML encoding. Pass either the edited XML file or the export folder.
 
-```bash
-python zte_f6600p_export.py edited.xml
-python zte_f6600p_export.py ./export-directory
+```text
+.\ZTE-F6600P-Export.exe .\export-directory\webcfg_dbase.xml
+.\ZTE-F6600P-Export.exe .\export-directory
 ```
 
 Choose a password for the new backup, then enter the router's GPON serial. Press Enter to accept the serial suggested from `telnet_show2.txt` in the same folder, if available. Otherwise, enter the full serial, for example `ZTEG12345678`.
