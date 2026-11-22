@@ -53,7 +53,9 @@ For offline decryption, pass the backup filename as the first argument. To try p
 python zte_f6600p_export.py edited.xml
 ```
 
-This writes `edited_repacked.cfg` in the same folder. For example, `home.v2.xml` becomes `home.v2_repacked.cfg`. The packing command runs without prompts. Copy the password printed in the terminal for the WEB restore.
+This writes `edited_repacked.cfg` in the same folder. For example, `home.v2.xml` becomes `home.v2_repacked.cfg`. You can also pass an export directory to pack its `webcfg_dbase.xml`.
+
+During packing, the tool asks for the GPON serial to write into the backup's Board S/N header. It looks for `telnet_show2.txt` in the supplied directory or, for an XML argument, beside the XML. Press Enter to accept the serial shown in brackets, or type a different one. If the file is missing or contains no usable serial, enter the full serial manually (for example, `ZTEG12345678`). Copy the password printed in the terminal for the WEB restore.
 
 ## Verify a rebuilt backup
 

@@ -261,13 +261,15 @@ def decrypt_internal_config(blob: bytes, gpon_sn: str, router_mac: str) -> bytes
     return unpack_zte_chunks(unwrapped)
 
 
+def show2_value(raw_telnet: str, key: str) -> str | None:
+    match = re.search(r'(?im)^[ \t]*' + re.escape(key) +
+                      r'[ \t]*\[ID:[ \t]*\d+\][ \t]+is set to[ \t]+([^\r\n]+)', raw_telnet)
+    return match.group(1).strip() if match else None
+
+
 def extract_internal_identity(raw_telnet: str) -> tuple[str, str]:
     """Read the unaltered GPON serial and MAC1 from `setmac show2`."""
-    def get(key: str) -> str | None:
-        match = re.search(r'(?im)^\s*'+re.escape(key)+r'\[ID:\s*\d+\]\s+is set to\s+([^\r\n]+)', raw_telnet)
-        return match.group(1).strip() if match else None
-
-    vendor, sn, mac = get('VENDORID'), get('GPONSN'), get('MAC1')
+    vendor, sn, mac = (show2_value(raw_telnet, key) for key in ('VENDORID', 'GPONSN', 'MAC1'))
     if not sn or not mac:
         raise ValueError('setmac show2 did not return both GPONSN and MAC1')
     return (vendor + sn if vendor else sn), mac
@@ -1123,6 +1125,24 @@ def save_config(out: Path, xml: bytes, blob: bytes,
     Progress.ok('webcfg_dbase.xml, webcfg_creds.txt')
 
 
+def ask_packing_serial(directory: Path) -> str:
+    serial_format = re.compile(r'[A-Za-z]{4}[0-9A-Fa-f]{8}')
+    try:
+        report = (directory / 'telnet_show2.txt').read_text(encoding='utf-8-sig', errors='replace')
+    except FileNotFoundError:
+        report = ''
+    candidate = show2_value(report, 'GPONSN') or ''
+    if re.fullmatch(r'[0-9A-Fa-f]{8}', candidate):
+        candidate = (show2_value(report, 'VENDORID') or '') + candidate
+    default = candidate.upper() if serial_format.fullmatch(candidate) else ''
+    hint = f' [{default}]' if default else ''
+    while True:
+        serial = input(f'    > GPON serial (e.g. ZTEG12345678){hint}: ').strip() or default
+        if serial_format.fullmatch(serial):
+            return serial.upper()
+        Progress.warn('Enter the four-letter vendor ID followed by eight hexadecimal digits.')
+
+
 def pack_xml_file(filename: Path, xml: bytes) -> int:
     Progress.title('ZTE WEB backup - packing')
     output = filename.with_name(f'{filename.stem}_repacked.cfg')
@@ -1132,7 +1152,10 @@ def pack_xml_file(filename: Path, xml: bytes) -> int:
             raise FileExistsError(output)
         password = backup_password_new()
         backup = pack_web_backup(xml, password)
-        safe_write(output, backup)
+        serial = ask_packing_serial(filename.parent)
+        board_sn = serial[:4].encode('ascii') + bytes.fromhex(serial[4:])
+        header = f'Board S/N: {board_sn.hex().upper()}\r\n'.encode('ascii')
+        safe_write(output, header + backup)
         Progress.ok(f'Created WEB backup: {output.resolve()}')
         Progress.action(f'Password for WEB restore: {password}')
         return 0
@@ -1161,6 +1184,8 @@ def offline_input_kind(filename: Path, blob: bytes) -> str:
 
 def offline(filename: Path) -> int:
     try:
+        if filename.is_dir():
+            filename = filename / 'webcfg_dbase.xml'
         if not filename.is_file():
             raise ValueError(f'Expected an existing input file: {filename}')
         blob = filename.read_bytes()
@@ -1418,7 +1443,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description='Export ZTE configuration or pack WEB XML into a Type-6 backup.')
     parser.add_argument('backup', nargs='?', type=Path,
-                        help='Offline input: WEB .cfg or native Type-6 DB to decrypt, WEB XML to pack.')
+                        help='Offline input: WEB .cfg or native Type-6 DB to decrypt, '
+                             'WEB XML or its export directory to pack.')
     parser.add_argument('--profile', choices=sorted(WEB_PROFILES), default=DEFAULT_PROFILE,
                         help='WEB endpoint profile (online mode).')
     args = parser.parse_args()
