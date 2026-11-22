@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ZTE F6600P configuration export and optional factory Telnet reader.
+"""ZTE F6600P configuration export, WEB backup packing, and factory Telnet reader.
 The script never reboots the router or changes its saved configuration.
 
 Factory-mode protocol adaptation references:
@@ -39,6 +39,8 @@ MAGIC = bytes.fromhex('999999994444444455555555aaaaaaaa')
 ZTE_IV = b'ZTE%FN$GponNJ025'
 PAYLOAD_MAGIC = 0x01020304
 SIG_MAGIC = 0x04030201
+MAX_CONFIG_SIZE = 32_000_000
+MAX_CONFIG_CHUNKS = 1024
 TIMEOUT = (5, 25)
 DEFAULT_PROFILE = 'vodafone_v14'
 
@@ -102,12 +104,12 @@ def safe_write(path: Path, contents: bytes) -> None:
     try:
         with os.fdopen(fd, 'wb') as out:
             out.write(contents)
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         path.unlink(missing_ok=True)
         raise
 
 
-def unpack_zte_chunks(inner: bytes, max_size: int = 32_000_000) -> bytes:
+def unpack_zte_chunks(inner: bytes, max_size: int = MAX_CONFIG_SIZE) -> bytes:
     """Unpack the shared ZTE payload format and check CRC/length."""
     if len(inner) < 72:
         raise ValueError('Decrypted ZTE payload is too short')
@@ -118,7 +120,7 @@ def unpack_zte_chunks(inner: bytes, max_size: int = 32_000_000) -> bytes:
         raise ValueError('Decompressed configuration exceeds size limit')
 
     pos, crc, output = 60, 0, bytearray()
-    for _ in range(1024):
+    for _ in range(MAX_CONFIG_CHUNKS):
         if pos + 12 > len(inner):
             raise ValueError('Truncated compressed ZTE chunk')
         n_plain, n_z, cont = struct.unpack_from('>III', inner, pos)
@@ -151,6 +153,12 @@ def unpack_zte_chunks(inner: bytes, max_size: int = 32_000_000) -> bytes:
     return bytes(output)
 
 
+def web_backup_cipher(password: str) -> Cipher:
+    key = hashlib.sha256(password.encode('utf-8')).digest()
+    iv = hashlib.sha256(ZTE_IV).digest()[:16]
+    return Cipher(algorithms.AES(key), modes.CBC(iv))
+
+
 def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
     i = blob.find(MAGIC)
     if i < 0:
@@ -174,12 +182,51 @@ def decrypt_backup(blob: bytes, backup_password: str) -> bytes:
     if (next_chunk != 0 or cipherlen % 16 != 0 or origlen > cipherlen
             or offset+cipherlen > len(data) or origlen < 60):
         raise ValueError('Unexpected ciphertext layout')
-    key = hashlib.sha256(backup_password.encode('utf-8')).digest()
-    iv = hashlib.sha256(ZTE_IV).digest()[:16]
-    dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    dec = web_backup_cipher(backup_password).decryptor()
     inner = (dec.update(bytes(data[offset:offset+cipherlen])) + dec.finalize())[:origlen]
     return unpack_zte_chunks(inner)
 
+
+def pack_zte_chunks(xml: bytes) -> bytes:
+    """Compress the XML in Type-0 chunks with data and header CRCs."""
+    chunk_size = 64 * 1024
+    crc, payload = 0, bytearray()
+    last_start = 60
+    for start in range(0, len(xml), chunk_size):
+        block = xml[start:start + chunk_size]
+        compressed = zlib.compress(block, level=9)
+        last_start = 60 + len(payload)
+        next_offset = last_start + 12 + len(compressed)
+        if start + len(block) == len(xml):
+            next_offset = 0
+        payload.extend(struct.pack('>III', len(block), len(compressed), next_offset))
+        payload.extend(compressed)
+        crc = zlib.crc32(compressed, crc)
+
+    fields = struct.pack('>6I', PAYLOAD_MAGIC, 0, len(xml), last_start, chunk_size, crc)
+    return fields + struct.pack('>I', zlib.crc32(fields)) + bytes(32) + payload
+
+
+def pack_web_backup(xml: bytes, password: str) -> bytes:
+    """Check XML syntax and build an encrypted ZTE F6600P WEB backup."""
+    if len(xml) > MAX_CONFIG_SIZE:
+        raise ValueError('XML exceeds the configuration size limit')
+    ET.fromstring(xml)
+
+    packed = pack_zte_chunks(xml)
+    enc = web_backup_cipher(password).encryptor()
+    ciphertext = enc.update(packed + bytes(-len(packed) % 16)) + enc.finalize()
+    signature = b'F6600P'
+    signature_block = struct.pack('>III', SIG_MAGIC, 0, len(signature)) + signature
+    type6_header = struct.pack('>II', PAYLOAD_MAGIC, 6) + bytes(52)
+    block_header = struct.pack('>III', len(packed), len(ciphertext), 0)
+    signed_size = len(signature_block) + len(type6_header) + len(block_header) + len(ciphertext)
+
+    outer = bytearray(MAGIC + bytes(112))
+    # ZTE's 128-byte outer header uses little-endian fields on this model.
+    struct.pack_into('<I', outer, 24, 4)
+    struct.pack_into('<IIII', outer, 60, 64, 2 << 16, len(outer), signed_size)
+    return bytes(outer) + signature_block + type6_header + block_header + ciphertext
 
 
 def decrypt_internal_config(blob: bytes, gpon_sn: str, router_mac: str) -> bytes:
@@ -214,13 +261,15 @@ def decrypt_internal_config(blob: bytes, gpon_sn: str, router_mac: str) -> bytes
     return unpack_zte_chunks(unwrapped)
 
 
+def show2_value(raw_telnet: str, key: str) -> str | None:
+    match = re.search(r'(?im)^[ \t]*' + re.escape(key) +
+                      r'[ \t]*\[ID:[ \t]*\d+\][ \t]+is set to[ \t]+([^\r\n]+)', raw_telnet)
+    return match.group(1).strip() if match else None
+
+
 def extract_internal_identity(raw_telnet: str) -> tuple[str, str]:
     """Read the unaltered GPON serial and MAC1 from `setmac show2`."""
-    def get(key: str) -> str | None:
-        match = re.search(r'(?im)^\s*'+re.escape(key)+r'\[ID:\s*\d+\]\s+is set to\s+([^\r\n]+)', raw_telnet)
-        return match.group(1).strip() if match else None
-
-    vendor, sn, mac = get('VENDORID'), get('GPONSN'), get('MAC1')
+    vendor, sn, mac = (show2_value(raw_telnet, key) for key in ('VENDORID', 'GPONSN', 'MAC1'))
     if not sn or not mac:
         raise ValueError('setmac show2 did not return both GPONSN and MAC1')
     return (vendor + sn if vendor else sn), mac
@@ -393,7 +442,7 @@ class Router:
 
 
 def backup_password_new() -> str:
-    """Only used in RAM: both downloads are decrypted before this program exits."""
+    """Generate a strong password that fits the WEB backup form."""
     alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
     return 'Zb4' + ''.join(secrets.choice(alphabet) for _ in range(21))
 
@@ -1035,11 +1084,13 @@ def new_output_dir() -> Path:
     stamp = datetime.datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')
     base = Path.cwd() / ('zte_export_' + stamp)
     folder, n = base, 1
-    while folder.exists():
-        folder = Path(str(base) + '_' + str(n))
-        n += 1
-    folder.mkdir(mode=0o700)
-    return folder
+    while True:
+        try:
+            folder.mkdir(mode=0o700)
+            return folder
+        except FileExistsError:
+            folder = base.with_name(f'{base.name}_{n}')
+            n += 1
 
 
 def _read_status(router: Router) -> dict[str, str]:
@@ -1074,25 +1125,82 @@ def save_config(out: Path, xml: bytes, blob: bytes,
     Progress.ok('webcfg_dbase.xml, webcfg_creds.txt')
 
 
-def offline(filename: Path) -> int:
-    Progress.title('ZTE configuration export - offline')
-    Progress.stage(1, 'Decrypting and validating configuration')
-    if not filename.is_file():
-        Progress.warn('Backup file not found.')
-        return 1
+def ask_packing_serial(directory: Path) -> str:
+    serial_format = re.compile(r'[A-Za-z]{4}[0-9A-Fa-f]{8}')
     try:
+        report = (directory / 'telnet_show2.txt').read_text(encoding='utf-8-sig', errors='replace')
+    except FileNotFoundError:
+        report = ''
+    candidate = show2_value(report, 'GPONSN') or ''
+    if re.fullmatch(r'[0-9A-Fa-f]{8}', candidate):
+        candidate = (show2_value(report, 'VENDORID') or '') + candidate
+    default = candidate.upper() if serial_format.fullmatch(candidate) else ''
+    hint = f' [{default}]' if default else ''
+    while True:
+        serial = input(f'    > GPON serial (e.g. ZTEG12345678){hint}: ').strip() or default
+        if serial_format.fullmatch(serial):
+            return serial.upper()
+        Progress.warn('Enter the four-letter vendor ID followed by eight hexadecimal digits.')
+
+
+def pack_xml_file(filename: Path, xml: bytes) -> int:
+    Progress.title('ZTE WEB backup - packing')
+    output = filename.with_name(f'{filename.stem}_repacked.cfg')
+    try:
+        # Skip compression on a repeat run. safe_write also handles concurrent writers.
+        if output.exists():
+            raise FileExistsError(output)
+        password = input('    > Password for WEB restore: ')
+        if not password:
+            raise ValueError('Backup password is required')
+        backup = pack_web_backup(xml, password)
+        serial = ask_packing_serial(filename.parent)
+        board_sn = serial[:4].encode('ascii') + bytes.fromhex(serial[4:])
+        header = f'Board S/N:{board_sn.hex().upper()}\n'.encode('ascii')
+        safe_write(output, header + backup)
+        Progress.ok(f'Created WEB backup: {output.resolve()}')
+        return 0
+    except FileExistsError:
+        Progress.warn(f'Backup already exists: {output}')
+        return 1
+    except (OSError, ValueError, LookupError, ET.ParseError, zlib.error) as exc:
+        Progress.warn(f'WEB backup packing failed: {type(exc).__name__}: {exc}')
+        return 1
+
+
+def offline_input_kind(filename: Path, blob: bytes) -> str:
+    if not blob:
+        raise ValueError(f'Input file is empty: {filename}')
+    if blob.startswith(struct.pack('>II', PAYLOAD_MAGIC, 6)):
+        return 'native'
+    if MAGIC in blob:
+        return 'web'
+    # The extension also routes malformed XML to the parser for a line/column error.
+    if (filename.suffix.lower() == '.xml' or re.match(rb'\s*<', blob)
+            or blob.startswith((codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE,
+                                codecs.BOM_UTF32_BE, b'\x00<'))):
+        return 'xml'
+    raise ValueError(f'Unrecognized file format: {filename}')
+
+
+def offline(filename: Path) -> int:
+    try:
+        if filename.is_dir():
+            filename = filename / 'webcfg_dbase.xml'
+        if not filename.is_file():
+            raise ValueError(f'Expected an existing input file: {filename}')
         blob = filename.read_bytes()
-        native = blob[:8] == struct.pack('>II', PAYLOAD_MAGIC, 6)
-        raw_xml = blob.lstrip().startswith((b'<?xml', b'<DB'))
-        if native:
+        kind = offline_input_kind(filename, blob)
+        if kind == 'xml':
+            return pack_xml_file(filename, blob)
+
+        Progress.title('ZTE configuration export - offline')
+        Progress.stage(1, 'Decrypting and validating configuration')
+        if kind == 'native':
             serial = input('    > GPON serial (ZTEG...): ').strip()
             mac = input('    > Router MAC1: ').strip()
             xml = decrypt_internal_config(blob, serial, mac)
             name = 'telnet_dbase.xml'
-        elif raw_xml:
-            xml = blob
-            ET.fromstring(xml)
-            name = 'webcfg_dbase.xml'
         else:
             password = input('    > Backup password: ')
             if not password:
@@ -1101,7 +1209,7 @@ def offline(filename: Path) -> int:
             name = 'webcfg_dbase.xml'
         out = new_output_dir()
         safe_write(out / name, xml)
-        if native:
+        if kind == 'native':
             Progress.ok(name)
         else:
             safe_write(out / 'webcfg_creds.txt',
@@ -1334,9 +1442,10 @@ def online(profile_name: str = DEFAULT_PROFILE) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Export ZTE configuration and collect internal Telnet data when available.')
+        description='Export ZTE configuration or pack WEB XML into a Type-6 backup.')
     parser.add_argument('backup', nargs='?', type=Path,
-                        help='Existing .cfg, native Type-6 database, or XML (offline mode).')
+                        help='Offline input: WEB .cfg or native Type-6 DB to decrypt, '
+                             'WEB XML or its export directory to pack.')
     parser.add_argument('--profile', choices=sorted(WEB_PROFILES), default=DEFAULT_PROFILE,
                         help='WEB endpoint profile (online mode).')
     args = parser.parse_args()
@@ -1351,3 +1460,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('\nInterrupted.', file=sys.stderr)
         raise SystemExit(130)
+    except EOFError:
+        Progress.warn('Input closed before all required answers were entered.')
+        raise SystemExit(1)
